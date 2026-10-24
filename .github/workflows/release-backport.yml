@@ -7,6 +7,10 @@ on:
   push:
     tags:
       - "v0.5.6.*-woa*"
+    # Branch pushes build the archive as an artifact, for testing before a tag
+    # publishes it. workflow_dispatch only works from the default branch.
+    branches:
+      - "**"
   workflow_dispatch:
 
 env:
