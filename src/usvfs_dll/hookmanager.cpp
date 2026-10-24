@@ -237,6 +237,9 @@ void HookManager::initHooks()
   installHook(kbaseMod, k32Mod, "ExitProcess", hook_ExitProcess);
 
   installHook(kbaseMod, k32Mod, "CreateProcessInternalW", hook_CreateProcessInternalW, reinterpret_cast<LPVOID*>(&CreateProcessInternalW));
+  // After CreateProcessInternalW: these forward to its hook, which calls it.
+  installHook(kbaseMod, k32Mod, "CreateProcessA", hook_CreateProcessA);
+  installHook(kbaseMod, k32Mod, "CreateProcessW", hook_CreateProcessW);
 
   installHook(kbaseMod, k32Mod, "MoveFileA", hook_MoveFileA);
   installHook(kbaseMod, k32Mod, "MoveFileW", hook_MoveFileW);

@@ -14,6 +14,8 @@
 #include <stringcast.h>
 #include <formatters.h>
 
+#include <vector>
+
 namespace ush = usvfs::shared;
 using ush::string_cast;
 using ush::CodePage;
@@ -333,6 +335,119 @@ BOOL WINAPI usvfs::hook_CreateProcessInternalW(
       .PARAM(cmdline);
   HOOK_END
 
+  return res;
+}
+
+namespace {
+
+// An ANSI string converted as CreateProcessInternalA converts it, keeping
+// null distinct from empty. File names use the file API code page
+// (SetFileApisToOEM), other strings the ANSI one.
+class AnsiToWide {
+public:
+  AnsiToWide(LPCSTR value, UINT codePage)
+  {
+    if (value == nullptr)
+      return;
+    int size = MultiByteToWideChar(codePage, 0, value, -1, nullptr, 0);
+    if (size <= 0) {
+      m_Failed = true;
+      return;
+    }
+    m_Value.resize(size);
+    if (MultiByteToWideChar(codePage, 0, value, -1, m_Value.data(), size) <= 0)
+      m_Failed = true;
+    else
+      m_Present = true;
+  }
+  bool failed() const { return m_Failed; }
+  // Writable, because CreateProcessInternalW may change the command line.
+  LPWSTR get() { return m_Present ? m_Value.data() : nullptr; }
+
+private:
+  bool m_Present = false;
+  bool m_Failed = false;
+  std::vector<wchar_t> m_Value;
+};
+
+UINT fileApiCodePage() { return AreFileApisANSI() ? CP_ACP : CP_OEMCP; }
+
+} // namespace
+
+BOOL WINAPI usvfs::hook_CreateProcessW(
+    LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles,
+    DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
+{
+  // CreateProcessW is CreateProcessInternalW without tokens. This takes no hook
+  // group itself: hook_CreateProcessInternalW takes CREATE_PROCESS and calls
+  // the export it hooked. Where that still enters its hook (x86, x64), the
+  // nested call finds the group taken and passes through to the original, so
+  // the child is injected once.
+  return hook_CreateProcessInternalW(
+      nullptr, lpApplicationName, lpCommandLine, lpProcessAttributes,
+      lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+      lpCurrentDirectory, lpStartupInfo, lpProcessInformation, nullptr);
+}
+
+BOOL WINAPI usvfs::hook_CreateProcessA(
+    LPCSTR lpApplicationName, LPSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles,
+    DWORD dwCreationFlags, LPVOID lpEnvironment, LPCSTR lpCurrentDirectory,
+    LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
+{
+  // What CreateProcessInternalA does before calling CreateProcessInternalW:
+  // convert the strings, including those in STARTUPINFO. The environment is
+  // passed on as is; CREATE_UNICODE_ENVIRONMENT says which kind it is.
+  BOOL res = FALSE;
+  DWORD lastError = ERROR_SUCCESS;
+  {
+    const UINT fileCodePage = fileApiCodePage();
+    AnsiToWide applicationName(lpApplicationName, fileCodePage);
+    AnsiToWide commandLine(lpCommandLine, fileCodePage);
+    AnsiToWide currentDirectory(lpCurrentDirectory, fileCodePage);
+    AnsiToWide reserved(lpStartupInfo ? lpStartupInfo->lpReserved : nullptr, CP_ACP);
+    AnsiToWide desktop(lpStartupInfo ? lpStartupInfo->lpDesktop : nullptr, CP_ACP);
+    AnsiToWide title(lpStartupInfo ? lpStartupInfo->lpTitle : nullptr, CP_ACP);
+    if (applicationName.failed() || commandLine.failed() || currentDirectory.failed()
+        || reserved.failed() || desktop.failed() || title.failed()) {
+      SetLastError(ERROR_INVALID_PARAMETER);
+      return FALSE;
+    }
+
+    STARTUPINFOEXW startupInfo{};
+    LPSTARTUPINFOW startupInfoPtr = nullptr;
+    if (lpStartupInfo != nullptr) {
+      // STARTUPINFOA and STARTUPINFOW differ only in their string types.
+      static_assert(sizeof(STARTUPINFOA) == sizeof(STARTUPINFOW), "STARTUPINFO layouts differ");
+      memcpy(&startupInfo.StartupInfo, lpStartupInfo, sizeof(STARTUPINFOA));
+      startupInfo.StartupInfo.lpReserved = reserved.get();
+      startupInfo.StartupInfo.lpDesktop = desktop.get();
+      startupInfo.StartupInfo.lpTitle = title.get();
+      // Only read the extended part when the caller says it's there.
+      if ((dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT)
+          && lpStartupInfo->cb >= sizeof(STARTUPINFOEXA)) {
+        startupInfo.lpAttributeList
+            = reinterpret_cast<LPSTARTUPINFOEXA>(lpStartupInfo)->lpAttributeList;
+        startupInfo.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+      } else if (lpStartupInfo->cb >= sizeof(STARTUPINFOA)) {
+        startupInfo.StartupInfo.cb = sizeof(STARTUPINFOW);
+      }
+      // A smaller cb is kept as it was, for CreateProcessInternalW to reject.
+      startupInfoPtr = &startupInfo.StartupInfo;
+    }
+
+    res = hook_CreateProcessInternalW(
+        nullptr, applicationName.get(), commandLine.get(), lpProcessAttributes,
+        lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+        currentDirectory.get(), startupInfoPtr, lpProcessInformation, nullptr);
+    lastError = GetLastError();
+  }
+  // Freeing the converted strings mustn't change what the caller sees.
+  SetLastError(lastError);
   return res;
 }
 
