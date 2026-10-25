@@ -14,6 +14,7 @@
 #include <stringcast.h>
 #include <formatters.h>
 
+#include <new>
 #include <vector>
 
 namespace ush = usvfs::shared;
@@ -404,7 +405,9 @@ BOOL WINAPI usvfs::hook_CreateProcessA(
   // passed on as is; CREATE_UNICODE_ENVIRONMENT says which kind it is.
   BOOL res = FALSE;
   DWORD lastError = ERROR_SUCCESS;
-  {
+  // Nothing may throw out of a hook: allocation failures become the error
+  // CreateProcessA would give.
+  try {
     const UINT fileCodePage = fileApiCodePage();
     AnsiToWide applicationName(lpApplicationName, fileCodePage);
     AnsiToWide commandLine(lpCommandLine, fileCodePage);
@@ -414,37 +417,41 @@ BOOL WINAPI usvfs::hook_CreateProcessA(
     AnsiToWide title(lpStartupInfo ? lpStartupInfo->lpTitle : nullptr, CP_ACP);
     if (applicationName.failed() || commandLine.failed() || currentDirectory.failed()
         || reserved.failed() || desktop.failed() || title.failed()) {
-      SetLastError(ERROR_INVALID_PARAMETER);
-      return FALSE;
-    }
-
-    STARTUPINFOEXW startupInfo{};
-    LPSTARTUPINFOW startupInfoPtr = nullptr;
-    if (lpStartupInfo != nullptr) {
-      // STARTUPINFOA and STARTUPINFOW differ only in their string types.
-      static_assert(sizeof(STARTUPINFOA) == sizeof(STARTUPINFOW), "STARTUPINFO layouts differ");
-      memcpy(&startupInfo.StartupInfo, lpStartupInfo, sizeof(STARTUPINFOA));
-      startupInfo.StartupInfo.lpReserved = reserved.get();
-      startupInfo.StartupInfo.lpDesktop = desktop.get();
-      startupInfo.StartupInfo.lpTitle = title.get();
-      // Only read the extended part when the caller says it's there.
-      if ((dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT)
-          && lpStartupInfo->cb >= sizeof(STARTUPINFOEXA)) {
-        startupInfo.lpAttributeList
-            = reinterpret_cast<LPSTARTUPINFOEXA>(lpStartupInfo)->lpAttributeList;
-        startupInfo.StartupInfo.cb = sizeof(STARTUPINFOEXW);
-      } else if (lpStartupInfo->cb >= sizeof(STARTUPINFOA)) {
-        startupInfo.StartupInfo.cb = sizeof(STARTUPINFOW);
+      lastError = GetLastError();  // from MultiByteToWideChar
+      if (lastError == ERROR_SUCCESS)
+        lastError = ERROR_INVALID_PARAMETER;
+    } else {
+      STARTUPINFOEXW startupInfo{};
+      LPSTARTUPINFOW startupInfoPtr = nullptr;
+      if (lpStartupInfo != nullptr) {
+        // STARTUPINFOA and STARTUPINFOW differ only in their string types.
+        static_assert(sizeof(STARTUPINFOA) == sizeof(STARTUPINFOW), "STARTUPINFO layouts differ");
+        memcpy(&startupInfo.StartupInfo, lpStartupInfo, sizeof(STARTUPINFOA));
+        startupInfo.StartupInfo.lpReserved = reserved.get();
+        startupInfo.StartupInfo.lpDesktop = desktop.get();
+        startupInfo.StartupInfo.lpTitle = title.get();
+        // Only read the extended part when the caller says it's there.
+        if ((dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT)
+            && lpStartupInfo->cb >= sizeof(STARTUPINFOEXA)) {
+          startupInfo.lpAttributeList
+              = reinterpret_cast<LPSTARTUPINFOEXA>(lpStartupInfo)->lpAttributeList;
+          startupInfo.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+        } else if (lpStartupInfo->cb >= sizeof(STARTUPINFOA)) {
+          startupInfo.StartupInfo.cb = sizeof(STARTUPINFOW);
+        }
+        // A smaller cb is kept as it was, for CreateProcessInternalW to reject.
+        startupInfoPtr = &startupInfo.StartupInfo;
       }
-      // A smaller cb is kept as it was, for CreateProcessInternalW to reject.
-      startupInfoPtr = &startupInfo.StartupInfo;
-    }
 
-    res = hook_CreateProcessInternalW(
-        nullptr, applicationName.get(), commandLine.get(), lpProcessAttributes,
-        lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-        currentDirectory.get(), startupInfoPtr, lpProcessInformation, nullptr);
-    lastError = GetLastError();
+      res = hook_CreateProcessInternalW(
+          nullptr, applicationName.get(), commandLine.get(), lpProcessAttributes,
+          lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+          currentDirectory.get(), startupInfoPtr, lpProcessInformation, nullptr);
+      lastError = GetLastError();
+    }
+  } catch (const std::bad_alloc &) {
+    res = FALSE;
+    lastError = ERROR_NOT_ENOUGH_MEMORY;
   }
   // Freeing the converted strings mustn't change what the caller sees.
   SetLastError(lastError);

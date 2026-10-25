@@ -10,7 +10,8 @@ on:
     # Branch pushes build the archive as an artifact, for testing before a tag
     # publishes it. workflow_dispatch only works from the default branch.
     branches:
-      - "**"
+      - "backport/**"
+      - "arm64ec-*"
   workflow_dispatch:
 
 env:
